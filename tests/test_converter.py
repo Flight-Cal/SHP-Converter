@@ -1,51 +1,40 @@
 from __future__ import annotations
 
-from converter import ShapeRecordData, geojson_bounds, records_to_geojson, records_to_gpx
+import geopandas as gpd
+from shapely.geometry import LineString, MultiLineString
+
+from converter import geodataframe_to_gpx
 
 
-def test_generates_gpx_tracks_for_polyline_parts() -> None:
-    records = [
-        ShapeRecordData(
-            shape_type_name="POLYLINE",
-            points=[(7.0, 50.0), (7.1, 50.1), (8.0, 51.0), (8.1, 51.1)],
-            parts=[0, 2],
-            attrs={"name": "Alpha"},
-        )
-    ]
+def test_generates_gpx_tracks_for_lines() -> None:
+    gdf = gpd.GeoDataFrame(
+        {
+            "name": ["Alpha", "Beta"],
+            "geometry": [
+                LineString([(7.0, 50.0), (7.1, 50.1)]),
+                MultiLineString([[(8.0, 51.0), (8.2, 51.2)], [(8.3, 51.3), (8.4, 51.4)]]),
+            ],
+        },
+        crs="EPSG:4326",
+    )
 
-    gpx = records_to_gpx(records, prj_text=None, track_name_prefix="SkyDemon", assume_wgs84_if_missing=True)
+    gpx = geodataframe_to_gpx(gdf, track_name_prefix="SkyDemon")
 
     assert "<gpx" in gpx
     assert "<trk>" in gpx
     assert "SkyDemon: Alpha" in gpx
-    assert gpx.count("<trkseg>") == 2
+    assert "SkyDemon: Beta" in gpx
+    assert gpx.count("<trkseg>") == 3
 
 
-def test_geojson_bounds_for_points() -> None:
-    records = [
-        ShapeRecordData(shape_type_name="POINT", points=[(-1.0, 10.0)], parts=[0], attrs={}),
-        ShapeRecordData(shape_type_name="POINT", points=[(2.0, 20.0)], parts=[0], attrs={}),
-    ]
-
-    geojson = records_to_geojson(records, prj_text=None, assume_wgs84_if_missing=True)
-    bounds = geojson_bounds(geojson)
-
-    assert bounds == (-1.0, 10.0, 2.0, 20.0)
-
-
-def test_missing_prj_raises_error_by_default() -> None:
-    records = [
-        ShapeRecordData(
-            shape_type_name="POINT",
-            points=[(7.0, 50.0)],
-            parts=[0],
-            attrs={},
-        )
-    ]
+def test_missing_crs_raises_error() -> None:
+    gdf = gpd.GeoDataFrame(
+        {"geometry": [LineString([(7.0, 50.0), (7.1, 50.1)])]},
+    )
 
     try:
-        records_to_gpx(records, prj_text=None)
+        geodataframe_to_gpx(gdf)
     except ValueError as exc:
-        assert "No .prj" in str(exc)
+        assert "no CRS" in str(exc)
     else:
-        raise AssertionError("Expected ValueError for missing .prj")
+        raise AssertionError("Expected ValueError for missing CRS")

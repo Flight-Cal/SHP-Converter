@@ -8,22 +8,19 @@ from typing import Iterable
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
-import shapefile  # pyshp
-from pyproj import CRS, Transformer
+import geopandas as gpd
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
 
 @dataclass(frozen=True)
-class ShapeRecordData:
-    """Normalized shape + attribute payload extracted from a shapefile."""
+class TrackSegment:
+    """A normalized sequence of (lon, lat) coordinates used for GPX track segments."""
 
-    shape_type_name: str
-    points: list[tuple[float, float]]
-    parts: list[int]
-    attrs: dict[str, object]
+    coordinates: list[tuple[float, float]]
 
 
-def load_shapefile(upload_bytes: bytes, filename: str) -> tuple[list[ShapeRecordData], str | None]:
-    """Load shape records from .zip or .shp upload and return records + optional .prj text."""
+def load_shapefile(upload_bytes: bytes, filename: str) -> gpd.GeoDataFrame:
+    """Load a shapefile from an uploaded zip or .shp stream into a GeoDataFrame."""
     suffix = Path(filename).suffix.lower()
 
     with TemporaryDirectory() as tmp:
@@ -43,67 +40,38 @@ def load_shapefile(upload_bytes: bytes, filename: str) -> tuple[list[ShapeRecord
         else:
             raise ValueError("Please upload either a .zip containing shapefile parts or a .shp file.")
 
-        reader = shapefile.Reader(str(shp_path))
-        field_names = [f[0] for f in reader.fields[1:]]
-        shape_records: list[ShapeRecordData] = []
+        gdf = gpd.read_file(shp_path)
 
-        for sr in reader.iterShapeRecords():
-            attrs = dict(zip(field_names, sr.record))
-            shape_records.append(
-                ShapeRecordData(
-                    shape_type_name=sr.shape.shapeTypeName,
-                    points=[(float(x), float(y)) for x, y in sr.shape.points],
-                    parts=list(sr.shape.parts),
-                    attrs=attrs,
-                )
-            )
+    if gdf.empty:
+        raise ValueError("The shapefile was loaded but contains no features.")
 
-        if not shape_records:
-            raise ValueError("The shapefile was loaded but contains no features.")
-
-        prj_path = shp_path.with_suffix(".prj")
-        prj_text = prj_path.read_text(encoding="utf-8", errors="ignore") if prj_path.exists() else None
-
-    return shape_records, prj_text
+    return gdf
 
 
-def _ensure_wgs84_points(
-    records: list[ShapeRecordData],
-    prj_text: str | None,
-    assume_wgs84_if_missing: bool,
-) -> list[ShapeRecordData]:
-    """Reproject shape points into EPSG:4326, or optionally assume input is already WGS84."""
-    if prj_text is None:
-        if not assume_wgs84_if_missing:
-            raise ValueError(
-                "No .prj CRS file found. Either upload a shapefile with CRS info or enable "
-                "'Assume WGS84 when .prj is missing'."
-            )
-        return records
+def _geometry_to_segments(geometry) -> list[TrackSegment]:
+    """Convert supported geometries into one or more GPX track segments."""
+    segments: list[TrackSegment] = []
 
-    source_crs = CRS.from_wkt(prj_text)
-    target_crs = CRS.from_epsg(4326)
-    if source_crs == target_crs:
-        return records
+    if isinstance(geometry, LineString):
+        segments.append(TrackSegment(coordinates=list(geometry.coords)))
+    elif isinstance(geometry, MultiLineString):
+        for line in geometry.geoms:
+            segments.append(TrackSegment(coordinates=list(line.coords)))
+    elif isinstance(geometry, Polygon):
+        # Use the polygon's exterior ring as a track segment.
+        segments.append(TrackSegment(coordinates=list(geometry.exterior.coords)))
+    elif isinstance(geometry, Point):
+        # For a point, create a one-point track segment.
+        segments.append(TrackSegment(coordinates=[(geometry.x, geometry.y)]))
+    else:
+        # Geometry type not supported for track conversion.
+        return []
 
-    transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
-    converted: list[ShapeRecordData] = []
-
-    for rec in records:
-        converted_points = [transformer.transform(x, y) for x, y in rec.points]
-        converted.append(
-            ShapeRecordData(
-                shape_type_name=rec.shape_type_name,
-                points=[(float(x), float(y)) for x, y in converted_points],
-                parts=rec.parts,
-                attrs=rec.attrs,
-            )
-        )
-
-    return converted
+    return [s for s in segments if len(s.coordinates) > 0]
 
 
-def _build_track_name(feature_index: int, attributes: dict[str, object]) -> str:
+def _build_track_name(feature_index: int, attributes: dict) -> str:
+    """Infer a readable track name from common fields, with a stable fallback."""
     preferred_fields = ("name", "Name", "track", "Track", "id", "ID")
     for key in preferred_fields:
         value = attributes.get(key)
@@ -112,100 +80,26 @@ def _build_track_name(feature_index: int, attributes: dict[str, object]) -> str:
     return f"Track {feature_index + 1}"
 
 
-def _segments_from_record(record: ShapeRecordData) -> list[list[tuple[float, float]]]:
-    """Convert pyshp record types into one or more lon/lat coordinate segments."""
-    t = record.shape_type_name.upper()
-    points = record.points
-    if not points:
-        return []
+def _ensure_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Ensure data are in WGS84 (EPSG:4326), the coordinate system expected by GPX."""
+    if gdf.crs is None:
+        raise ValueError(
+            "The shapefile has no CRS information (.prj missing or unreadable). "
+            "Please provide a valid CRS so it can be converted to WGS84."
+        )
 
-    if t in {"POLYLINE", "POLYLINEZ", "POLYLINEM", "POLYLINEZM"}:
-        part_indexes = record.parts + [len(points)]
-        return [points[part_indexes[i] : part_indexes[i + 1]] for i in range(len(part_indexes) - 1)]
+    if gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
 
-    if t in {"POLYGON", "POLYGONZ", "POLYGONM", "POLYGONZM"}:
-        part_indexes = record.parts + [len(points)]
-        return [points[part_indexes[i] : part_indexes[i + 1]] for i in range(len(part_indexes) - 1)]
-
-    if t in {"POINT", "POINTZ", "POINTM"}:
-        return [[points[0]]]
-
-    return []
+    return gdf
 
 
-def records_to_geojson(
-    records: list[ShapeRecordData],
-    prj_text: str | None,
-    assume_wgs84_if_missing: bool = False,
-) -> dict:
-    """Convert records into WGS84 GeoJSON for map display."""
-    wgs84_records = _ensure_wgs84_points(records, prj_text, assume_wgs84_if_missing)
-    features: list[dict] = []
-
-    for idx, rec in enumerate(wgs84_records):
-        segments = [seg for seg in _segments_from_record(rec) if seg]
-        if not segments:
-            continue
-
-        kind = rec.shape_type_name.upper()
-        props = {
-            "name": _build_track_name(idx, rec.attrs),
-            "shape_type": rec.shape_type_name,
-        }
-
-        if kind.startswith("POINT"):
-            geom = {"type": "Point", "coordinates": [segments[0][0][0], segments[0][0][1]]}
-        elif kind.startswith("POLYGON"):
-            rings = [[[lon, lat] for lon, lat in seg] for seg in segments]
-            geom = {"type": "Polygon", "coordinates": rings}
-        elif len(segments) == 1:
-            geom = {"type": "LineString", "coordinates": [[lon, lat] for lon, lat in segments[0]]}
-        else:
-            geom = {
-                "type": "MultiLineString",
-                "coordinates": [[[lon, lat] for lon, lat in seg] for seg in segments],
-            }
-
-        features.append({"type": "Feature", "properties": props, "geometry": geom})
-
-    return {"type": "FeatureCollection", "features": features}
-
-
-def geojson_bounds(geojson: dict) -> tuple[float, float, float, float] | None:
-    """Return (min_lon, min_lat, max_lon, max_lat) for a FeatureCollection."""
-    all_points: list[tuple[float, float]] = []
-
-    def add_points(coords):
-        if isinstance(coords, list) and coords and isinstance(coords[0], (int, float)):
-            all_points.append((float(coords[0]), float(coords[1])))
-            return
-        for item in coords or []:
-            add_points(item)
-
-    for feature in geojson.get("features", []):
-        geometry = feature.get("geometry") or {}
-        coords = geometry.get("coordinates")
-        if coords is not None:
-            add_points(coords)
-
-    if not all_points:
-        return None
-
-    lons = [p[0] for p in all_points]
-    lats = [p[1] for p in all_points]
-    return min(lons), min(lats), max(lons), max(lats)
-
-
-def records_to_gpx(
-    records: list[ShapeRecordData],
-    prj_text: str | None,
-    track_name_prefix: str = "SHP Track",
-    assume_wgs84_if_missing: bool = False,
-) -> str:
-    """Convert shape records into a GPX 1.1 document with track segments."""
-    records = _ensure_wgs84_points(records, prj_text, assume_wgs84_if_missing)
+def geodataframe_to_gpx(gdf: gpd.GeoDataFrame, track_name_prefix: str = "SHP Track") -> str:
+    """Convert a GeoDataFrame into a GPX 1.1 document containing tracks and segments."""
+    gdf = _ensure_wgs84(gdf)
 
     ET.register_namespace("", "http://www.topografix.com/GPX/1/1")
+
     root = ET.Element(
         "{http://www.topografix.com/GPX/1/1}gpx",
         attrib={
@@ -224,34 +118,45 @@ def records_to_gpx(
     time_elem.text = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     tracks_added = 0
-    for i, record in enumerate(records):
-        segments = [seg for seg in _segments_from_record(record) if seg]
+
+    for i, row in gdf.iterrows():
+        geometry = row.geometry
+        if geometry is None or geometry.is_empty:
+            continue
+
+        segments = _geometry_to_segments(geometry)
         if not segments:
             continue
 
         trk = ET.SubElement(root, "{http://www.topografix.com/GPX/1/1}trk")
         name = ET.SubElement(trk, "{http://www.topografix.com/GPX/1/1}name")
-        name.text = f"{track_name_prefix}: {_build_track_name(i, record.attrs)}"
+        attrs = row.drop(labels=["geometry"]).to_dict()
+        inferred_name = _build_track_name(i, attrs)
+        name.text = f"{track_name_prefix}: {inferred_name}"
 
         for segment in segments:
             trkseg = ET.SubElement(trk, "{http://www.topografix.com/GPX/1/1}trkseg")
-            for lon, lat in segment:
-                ET.SubElement(
+            for lon, lat, *rest in segment.coordinates:
+                trkpt = ET.SubElement(
                     trkseg,
                     "{http://www.topografix.com/GPX/1/1}trkpt",
                     attrib={"lat": f"{lat:.8f}", "lon": f"{lon:.8f}"},
                 )
+                if rest:
+                    ele = ET.SubElement(trkpt, "{http://www.topografix.com/GPX/1/1}ele")
+                    ele.text = f"{float(rest[0]):.2f}"
 
         tracks_added += 1
 
     if tracks_added == 0:
-        raise ValueError("No supported geometries found. Use Polyline, Polygon, or Point shapefiles.")
+        raise ValueError("No supported geometries were found. Use LineString, MultiLineString, Polygon, or Point.")
 
     _indent_xml(root)
     return ET.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 
 def _indent_xml(elem: ET.Element, level: int = 0) -> None:
+    """In-place pretty-print indentation for XML serialization."""
     indent = "\n" + level * "  "
     if len(elem):
         if not elem.text or not elem.text.strip():
@@ -264,5 +169,6 @@ def _indent_xml(elem: ET.Element, level: int = 0) -> None:
         elem.tail = indent
 
 
-def collect_supported_geometries(records: list[ShapeRecordData]) -> Iterable[str]:
-    return sorted({r.shape_type_name for r in records})
+def collect_supported_geometries(gdf: gpd.GeoDataFrame) -> Iterable[str]:
+    """Return sorted geometry types present in the file."""
+    return sorted({str(geom_type) for geom_type in gdf.geom_type.unique()})
