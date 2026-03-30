@@ -1,0 +1,3 @@
+streamlit>=1.33
+pyshp>=2.3.1
+pyproj>=3.6
